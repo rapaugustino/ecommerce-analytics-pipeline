@@ -1,0 +1,375 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Capstone Project - Single Bucket Medallion Architecture
+
+Parameters:
+  StudentId:
+    Type: String
+    Description: My student ID for unique resource naming.
+    Default: rap7777
+    AllowedPattern: ^[a-z0-9-]+$
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens
+
+Resources:
+  # ==================================================================
+  # S3 BUCKET (All data layers: Bronze, Silver, Gold)
+  # ==================================================================
+
+  CapstoneDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub capstone-data-${StudentId}-${AWS::AccountId}
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldRawEvents
+            Status: Enabled
+            ExpirationInDays: 30
+            NoncurrentVersionExpirationInDays: 7
+            Prefix: capstone/raw/
+          - Id: DeleteOldProcessedData
+            Status: Enabled
+            ExpirationInDays: 60
+            Prefix: capstone/silver/
+          - Id: DeleteOldGoldData
+            Status: Enabled
+            ExpirationInDays: 90
+            Prefix: capstone/gold/
+  # ==================================================================
+  # 1. INGESTION LAYER (Lambda + EventBridge)
+  # ==================================================================
+
+  EventGeneratorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub capstone-event-generator-${StudentId}
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !Sub arn:aws:iam::${AWS::AccountId}:role/LabRole
+      Timeout: 900
+      MemorySize: 3008
+      Environment:
+        Variables:
+          TARGET_BUCKET: !Ref CapstoneDataBucket
+          TARGET_PREFIX: capstone/raw/
+      Code:
+        ZipFile: |
+          import json
+          import gzip
+          import os
+          from datetime import datetime, timezone
+          import random
+          import boto3
+
+          s3_client = boto3.client('s3')
+
+          # --- DATA DEFINITIONS ---
+          CATEGORIES = ["electronics", "clothing", "home", "books", "sports", "toys"]
+          PRODUCTS = {
+              "electronics": ["p_1001", "p_1002", "p_1003", "p_1004", "p_1005"],
+              "clothing": ["p_2001", "p_2002", "p_2003", "p_2004", "p_2005"],
+              "home": ["p_3001", "p_3002", "p_3003", "p_3004", "p_3005"],
+              "books": ["p_4001", "p_4002", "p_4003", "p_4004", "p_4005"],
+              "sports": ["p_5001", "p_5002", "p_5003", "p_5004", "p_5005"],
+              "toys": ["p_6001", "p_6002", "p_6003", "p_6004", "p_6005"],
+          }
+          SEARCH_QUERIES = [
+              "wireless headphones", "running shoes", "coffee maker",
+              "python books", "yoga mat", "laptop stand", "winter jacket"
+          ]
+
+          def get_random_event_count():
+              # Generating enough data for the project requirements
+              return random.randint(500_000, 750_000)
+
+          def generate_product_context():
+              category = random.choice(CATEGORIES)
+              product_id = random.choice(PRODUCTS[category])
+              quantity = random.randint(1, 5)
+              price = round(random.uniform(9.99, 299.99), 2)
+              return {"product_id": product_id, "category": category, "quantity": quantity, "price": price}
+
+          def generate_event():
+              timestamp = datetime.now(timezone.utc).isoformat()
+              user_id = f"u_{random.randint(10000, 99999)}"
+              session_id = f"s_{random.randint(10000, 99999)}"
+              event_type = random.choices(
+                  ["page_view", "add_to_cart", "remove_from_cart", "purchase", "search"],
+                  weights=[50, 20, 10, 10, 10], k=1
+              )[0]
+
+              event = {
+                  "timestamp": timestamp, "user_id": user_id, "session_id": session_id,
+                  "event_type": event_type, "product_id": None, "quantity": None,
+                  "price": None, "category": None, "search_query": None
+              }
+
+              if event_type == "search":
+                  event["search_query"] = random.choice(SEARCH_QUERIES)
+              else:
+                  ctx = generate_product_context()
+                  event["product_id"] = ctx["product_id"]
+                  event["category"] = ctx["category"]
+                  if event_type in ["add_to_cart", "remove_from_cart", "purchase"]:
+                      event["quantity"] = ctx["quantity"]
+                      event["price"] = ctx["price"]
+              return event
+
+          def lambda_handler(event, context):
+              bucket_name = os.environ['TARGET_BUCKET']
+              prefix = os.environ['TARGET_PREFIX'] # e.g., capstone/raw/
+
+              event_count = get_random_event_count()
+              print(f"Generating {event_count:,} events")
+
+              # Generate JSONL
+              lines = []
+              for _ in range(event_count):
+                  lines.append(json.dumps(generate_event()))
+              jsonl_content = '\n'.join(lines)
+
+              # Compress
+              compressed_content = gzip.compress(jsonl_content.encode('utf-8'))
+
+              now = datetime.now(timezone.utc)
+              timestamp = now.strftime("%Y%m%d-%H%M%S")
+              s3_key = f"{prefix}events/year={now.year:04d}/month={now.month:02d}/day={now.day:02d}/hour={now.hour:02d}/minute={now.minute:02d}/events-{timestamp}.jsonl.gz"
+
+              s3_client.put_object(
+                  Bucket=bucket_name, Key=s3_key, Body=compressed_content,
+                  ContentType='application/gzip', ContentEncoding='gzip'
+              )
+              return {"statusCode": 200, "body": json.dumps({"s3_key": s3_key})}
+
+  EventGeneratorSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub capstone-generator-schedule-${StudentId}
+      ScheduleExpression: rate(5 minutes)
+      State: DISABLED
+      Targets:
+        - Arn: !GetAtt EventGeneratorFunction.Arn
+          Id: EventGeneratorTarget
+
+  EventGeneratorPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref EventGeneratorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt EventGeneratorSchedule.Arn
+
+  # ==================================================================
+  # 2. METADATA LAYER (Glue Catalog)
+  # ==================================================================
+
+  AnalyticsGlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub capstone_db_${StudentId}
+        Description: Database for e-commerce event analytics
+
+  # ==================================================================
+  # 3. BRONZE LAYER (Source Crawler)
+  # ==================================================================
+
+  SourceCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub capstone-source-crawler-${StudentId}
+      Role: !Sub arn:aws:iam::${AWS::AccountId}:role/LabRole
+      DatabaseName: !Ref AnalyticsGlueDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub s3://${CapstoneDataBucket}/capstone/raw/events/
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: DEPRECATE_IN_DATABASE
+
+  # ==================================================================
+  # 4. PROCESSING LAYER (Glue ETL Job)
+  # ==================================================================
+
+  EventProcessingJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub capstone-etl-job-${StudentId}
+      Role: !Sub arn:aws:iam::${AWS::AccountId}:role/LabRole
+      GlueVersion: '4.0'
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub s3://${CapstoneDataBucket}/capstone/scripts/etl_script.py
+        PythonVersion: '3'
+      DefaultArguments:
+        '--job-bookmark-option': job-bookmark-enable
+        '--TempDir': !Sub s3://${CapstoneDataBucket}/capstone/temp/
+        '--enable-metrics': 'true'
+        '--enable-continuous-cloudwatch-log': 'true'
+        '--source_database': !Ref AnalyticsGlueDatabase
+        '--source_table': events
+        '--silver_path': !Sub s3://${CapstoneDataBucket}/capstone/silver/events/
+        '--gold_path': !Sub s3://${CapstoneDataBucket}/capstone/gold/
+      MaxRetries: 1
+      NumberOfWorkers: 2
+      WorkerType: G.1X
+      Timeout: 60
+
+  # ==================================================================
+  # 5. SILVER LAYER (Enriched Events Crawler)
+  # ==================================================================
+
+  SilverCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub capstone-silver-crawler-${StudentId}
+      Role: !Sub arn:aws:iam::${AWS::AccountId}:role/LabRole
+      DatabaseName: !Ref AnalyticsGlueDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub s3://${CapstoneDataBucket}/capstone/silver/events/
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: DEPRECATE_IN_DATABASE
+
+  # ==================================================================
+  # 6. GOLD LAYER (Analytics Tables Crawler)
+  # ==================================================================
+
+  GoldCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub capstone-gold-crawler-${StudentId}
+      Role: !Sub arn:aws:iam::${AWS::AccountId}:role/LabRole
+      DatabaseName: !Ref AnalyticsGlueDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub s3://${CapstoneDataBucket}/capstone/gold/product_funnel/
+          - Path: !Sub s3://${CapstoneDataBucket}/capstone/gold/hourly_revenue/
+          - Path: !Sub s3://${CapstoneDataBucket}/capstone/gold/product_popularity/
+          - Path: !Sub s3://${CapstoneDataBucket}/capstone/gold/category_daily_performance/
+          - Path: !Sub s3://${CapstoneDataBucket}/capstone/gold/daily_user_activity/
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: DEPRECATE_IN_DATABASE
+
+  # ==================================================================
+  # 7. ORCHESTRATION (Manual Glue Job Execution)
+  # ==================================================================
+  # Note: Removed automatic EventBridge trigger due to LabRole permission limitations
+  # ETL job will be triggered manually via AWS CLI: aws glue start-job-run --job-name capstone-etl-job-rap7777
+
+  # ==================================================================
+  # 8. QUERY LAYER (Athena Workgroup)
+  # ==================================================================
+
+  AnalyticsWorkgroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub capstone-analytics-${StudentId}
+      Description: Workgroup for capstone analytics queries
+      WorkGroupConfiguration:
+        ResultConfiguration:
+          OutputLocation: !Sub s3://${CapstoneDataBucket}/capstone/athena-results/
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+
+  # ==================================================================
+  # CLEANUP (Auto-empty bucket on stack deletion)
+  # ==================================================================
+
+  BucketCleanupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub capstone-bucket-cleanup-${StudentId}
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !Sub arn:aws:iam::${AWS::AccountId}:role/LabRole
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+
+          def handler(event, context):
+              try:
+                  if event['RequestType'] == 'Delete':
+                      bucket_name = event['ResourceProperties']['BucketName']
+                      print(f"Emptying bucket: {bucket_name}")
+                      s3 = boto3.resource('s3')
+                      bucket = s3.Bucket(bucket_name)
+                      bucket.object_versions.all().delete()
+                      print(f"Bucket {bucket_name} emptied successfully")
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+  BucketCleanup:
+    Type: Custom::BucketCleanup
+    Properties:
+      ServiceToken: !GetAtt BucketCleanupFunction.Arn
+      BucketName: !Ref CapstoneDataBucket
+
+Outputs:
+  BucketName:
+    Description: S3 bucket for all capstone data (Bronze, Silver, Gold)
+    Value: !Ref CapstoneDataBucket
+    Export:
+      Name: !Sub ${AWS::StackName}-Bucket
+  GlueDatabaseName:
+    Description: Glue database containing all tables
+    Value: !Ref AnalyticsGlueDatabase
+    Export:
+      Name: !Sub ${AWS::StackName}-Database
+
+  SourceCrawlerName:
+    Description: Crawler for Bronze layer (raw events)
+    Value: !Ref SourceCrawler
+
+  SilverCrawlerName:
+    Description: Crawler for Silver layer (enriched events)
+    Value: !Ref SilverCrawler
+
+  GoldCrawlerName:
+    Description: Crawler for Gold layer (analytics tables)
+    Value: !Ref GoldCrawler
+
+  GlueJobName:
+    Description: ETL job name
+    Value: !Ref EventProcessingJob
+
+  AthenaWorkgroupName:
+    Description: Athena workgroup for queries
+    Value: !Ref AnalyticsWorkgroup
+
+  RawDataLocation:
+    Description: S3 location of Bronze layer (raw events)
+    Value: !Sub s3://${CapstoneDataBucket}/capstone/raw/events/
+
+  SilverDataLocation:
+    Description: S3 location of Silver layer (enriched events)
+    Value: !Sub s3://${CapstoneDataBucket}/capstone/silver/events/
+    Export:
+      Name: !Sub ${AWS::StackName}-SilverLocation
+
+  GoldDataLocation:
+    Description: S3 location of Gold layer (analytics tables)
+    Value: !Sub s3://${CapstoneDataBucket}/capstone/gold/
+    Export:
+      Name: !Sub ${AWS::StackName}-GoldLocation
+
+  ScriptUploadCommand:
+    Description: Command to upload ETL script after stack deployment
+    Value: !Sub aws s3 cp etl_script.py
+      s3://${CapstoneDataBucket}/capstone/scripts/etl_script.py

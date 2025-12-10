@@ -1,0 +1,38 @@
+---
+config:
+  layout: dagre
+  theme: forest
+---
+flowchart TB
+    Lambda["Lambda Function<br>Event Generator"] -- Write Events --> Bronze[("Bronze Layer<br>Raw JSONL.gz<br>Hive Partitioned")]
+    Bronze --> S3["S3 Bucket"]
+    Silver[("Silver Layer<br>Parquet<br>Date Partitioned")] --> S3
+    Gold[("Gold Layer<br>5 Pre-Aggregated Tables<br>Parquet")] --> S3
+    Bronze -- Discover Schema --> Crawler1["Glue Crawler<br>Source"]
+    Crawler1 -- Register Tables --> Catalog[("Glue Data Catalog")]
+    Catalog -- Read Metadata --> ETL["Glue ETL Job<br>Job Bookmarks Enabled"]
+    Bronze -- Read Raw Data --> ETL
+    ETL -- Transform & Enrich --> Silver
+    ETL -- Aggregate --> Gold
+    Silver -- Discover Schema --> Crawler2["Glue Crawler<br>Silver"]
+    Crawler2 -- Register Tables --> Catalog
+    Gold -- Discover Schema --> Crawler3["Glue Crawler<br>Gold"]
+    Crawler3 -- Register Tables --> Catalog
+    Catalog -- Table Metadata --> Athena["Amazon Athena<br>Workgroup"]
+    Gold -- Query Data --> Athena
+
+     Lambda:::generation
+     Bronze:::storage
+     S3:::storage
+     Silver:::storage
+     Gold:::storage
+     Crawler1:::processing
+     Catalog:::processing
+     ETL:::processing
+     Crawler2:::processing
+     Crawler3:::processing
+     Athena:::query
+    classDef storage fill:#B3D9FF,stroke:#0066CC,stroke-width:2px
+    classDef processing fill:#C9F0C9,stroke:#339933,stroke-width:2px
+    classDef query fill:#FFD9B3,stroke:#FF6600,stroke-width:2px
+    classDef generation fill:#E6CCF5,stroke:#9933FF,stroke-width:2px

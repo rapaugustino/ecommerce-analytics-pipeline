@@ -2,7 +2,7 @@
 
 # E-Commerce Analytics Pipeline
 
-![High Level Architecture Diagram](./architecture-diagram.png)
+![High Level Architecture Diagram](./docs/architecture-diagram.png)
 
 ## Architecture Overview
 
